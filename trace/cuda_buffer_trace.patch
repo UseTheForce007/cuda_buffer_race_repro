@@ -1,0 +1,129 @@
+diff --git a/cuda_buffer_backend/cuda_buffer/include/cuda_buffer/cuda_memory_pool.hpp b/cuda_buffer_backend/cuda_buffer/include/cuda_buffer/cuda_memory_pool.hpp
+index c39d9d4..b8cf153 100644
+--- a/cuda_buffer_backend/cuda_buffer/include/cuda_buffer/cuda_memory_pool.hpp
++++ b/cuda_buffer_backend/cuda_buffer/include/cuda_buffer/cuda_memory_pool.hpp
+@@ -19,6 +19,7 @@
+ #include <cuda_runtime.h>
+ 
+ #include <atomic>
++#include "cuda_buffer/trace_log.hpp"
+ #include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+@@ -87,6 +88,8 @@ public:
+     }
+     uint64_t uid = uid_dist_(uid_rng_);
+     block->current_uid = uid;
++    cuda_buffer_trace::log("S %d %u %lu %lu\n", static_cast<int>(::getpid()), block->block_id,
++      static_cast<unsigned long>(uid), static_cast<unsigned long>(cuda_buffer_trace::now_us()));
+     if (block->ipc_meta) {
+       block->ipc_meta->uid.store(uid, std::memory_order_release);
+       block->ipc_meta->publish_timestamp_us.store(
+diff --git a/cuda_buffer_backend/cuda_buffer/include/cuda_buffer/trace_log.hpp b/cuda_buffer_backend/cuda_buffer/include/cuda_buffer/trace_log.hpp
+new file mode 100644
+index 0000000..d68714a
+--- /dev/null
++++ b/cuda_buffer_backend/cuda_buffer/include/cuda_buffer/trace_log.hpp
+@@ -0,0 +1,45 @@
++// TEMPORARY instrumentation for diagnosing wrong-frame reads. Not for commit.
++#ifndef CUDA_BUFFER__TRACE_LOG_HPP_
++#define CUDA_BUFFER__TRACE_LOG_HPP_
++
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <chrono>
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
++namespace cuda_buffer_trace
++{
++inline int fd()
++{
++  static const int f = []() {
++      const char * p = std::getenv("CUDA_BUFFER_TRACE");
++      return p ? ::open(p, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;
++    }();
++  return f;
++}
++
++inline uint64_t now_us()
++{
++  return static_cast<uint64_t>(
++    std::chrono::duration_cast<std::chrono::microseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
++inline void log(const char * fmt, ...)
++{
++  const int f = fd();
++  if (f < 0) {return;}
++  char buf[256];
++  va_list ap;
++  va_start(ap, fmt);
++  const int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
++  va_end(ap);
++  if (n > 0) {(void)!::write(f, buf, static_cast<size_t>(n));}
++}
++}  // namespace cuda_buffer_trace
++
++#endif  // CUDA_BUFFER__TRACE_LOG_HPP_
+diff --git a/cuda_buffer_backend/cuda_buffer/src/cuda_buffer_ipc_manager.cpp b/cuda_buffer_backend/cuda_buffer/src/cuda_buffer_ipc_manager.cpp
+index b27e1fc..59c6e3e 100644
+--- a/cuda_buffer_backend/cuda_buffer/src/cuda_buffer_ipc_manager.cpp
++++ b/cuda_buffer_backend/cuda_buffer/src/cuda_buffer_ipc_manager.cpp
+@@ -13,6 +13,7 @@
+ // limitations under the License.
+ 
+ #include "cuda_buffer/cuda_buffer_ipc_manager.hpp"
++#include "cuda_buffer/trace_log.hpp"
+ 
+ #include <fcntl.h>
+ #include <sys/epoll.h>
+@@ -458,9 +459,16 @@ CudaVmmIPCManager::ImportResult CudaVmmIPCManager::import_block(
+     try {
+       check_uid_staleness(meta, block_id, pid, expected_uid);
+     } catch (...) {
++      cuda_buffer_trace::log("X %d %d %u %lu %lu\n", static_cast<int>(::getpid()), pid, block_id,
++        static_cast<unsigned long>(expected_uid), static_cast<unsigned long>(cuda_buffer_trace::now_us()));
+       if (meta) {meta->refcount.fetch_sub(1, std::memory_order_release);}
+       throw;
+     }
++    cuda_buffer_trace::log("I %d %d %u %lu %lu %d %lu\n", static_cast<int>(::getpid()), pid, block_id,
++      static_cast<unsigned long>(expected_uid),
++      static_cast<unsigned long>(meta ? meta->uid.load() : 0),
++      meta ? static_cast<int>(meta->refcount.load()) : -1,
++      static_cast<unsigned long>(cuda_buffer_trace::now_us()));
+     return {it->second.va, meta};
+   }
+ 
+@@ -505,7 +513,14 @@ CudaVmmIPCManager::ImportResult CudaVmmIPCManager::import_block(
+ 
+   try {
+     check_uid_staleness(ipc_meta, block_id, pid, expected_uid);
++    cuda_buffer_trace::log("I %d %d %u %lu %lu %d %lu\n", static_cast<int>(::getpid()), pid, block_id,
++      static_cast<unsigned long>(expected_uid),
++      static_cast<unsigned long>(ipc_meta ? ipc_meta->uid.load() : 0),
++      ipc_meta ? static_cast<int>(ipc_meta->refcount.load()) : -1,
++      static_cast<unsigned long>(cuda_buffer_trace::now_us()));
+   } catch (...) {
++    cuda_buffer_trace::log("X %d %d %u %lu %lu\n", static_cast<int>(::getpid()), pid, block_id,
++      static_cast<unsigned long>(expected_uid), static_cast<unsigned long>(cuda_buffer_trace::now_us()));
+     cleanup_failed_import();
+     throw;
+   }
+diff --git a/cuda_buffer_backend/cuda_buffer/src/cuda_memory_pool.cpp b/cuda_buffer_backend/cuda_buffer/src/cuda_memory_pool.cpp
+index dd7edda..87b55a1 100644
+--- a/cuda_buffer_backend/cuda_buffer/src/cuda_memory_pool.cpp
++++ b/cuda_buffer_backend/cuda_buffer/src/cuda_memory_pool.cpp
+@@ -153,6 +153,8 @@ VmmBlock * CudaMemoryPool::allocate(size_t byte_size)
+         if (block->ipc_meta) {
+           block->ipc_meta->publish_timestamp_us.store(0, std::memory_order_release);
+         }
++        cuda_buffer_trace::log("A %d %u %lu\n", static_cast<int>(::getpid()), block->block_id,
++          static_cast<unsigned long>(cuda_buffer_trace::now_us()));
+         return block;
+       }
+     }
