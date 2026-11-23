@@ -1,6 +1,7 @@
 // Publishes CUDA-backed sensor_msgs/Image. Frame N has every byte set to (N % 256) and
 // header.frame_id set to the decimal string of N, so a subscriber can tell which frame's pixels it got.
-// Usage: race_publisher <topic> <width> <height> <rate_hz> <seconds>
+// Usage: race_publisher <topic> <width> <height> <rate_hz> <seconds> [sync]
+// With "sync", the fill is synchronized (cudaStreamSynchronize) before publish().
 #include <cuda_runtime.h>
 
 #include <chrono>
@@ -23,6 +24,7 @@ int main(int argc, char ** argv)
   const size_t w = std::stoul(argv[2]), h = std::stoul(argv[3]);
   const double rate = std::stod(argv[4]);
   const double seconds = std::stod(argv[5]);
+  const bool sync = argc > 6 && std::string(argv[6]) == "sync";
   const size_t bytes = w * h * 3;
 
   auto node = std::make_shared<rclcpp::Node>("race_publisher");
@@ -47,6 +49,7 @@ int main(int argc, char ** argv)
     msg.step = w * 3;
     auto wh = cuda_buffer_backend::from_output_buffer(msg.data, stream);
     cudaMemsetAsync(wh.get_ptr(), static_cast<int>(i % 256), bytes, stream);
+    if (sync) {cudaStreamSynchronize(stream);}
     pub->publish(msg);
     next += period;
     std::this_thread::sleep_until(next);

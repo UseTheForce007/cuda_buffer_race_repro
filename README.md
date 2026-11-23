@@ -56,6 +56,12 @@ Linux 7.0.0-43-generic, ROS 2 Rolling, rmw_fastrtps_cpp, CUDA 12.3, NVIDIA RTX 3
 | copy, work_ms=5, run 1 | 666 | 2 | +3, +3 |
 | copy, work_ms=5, run 2 | 747 | 0 | |
 
+Synchronizing the publisher's CUDA stream before `publish()` does not prevent it (`run.sh ... serialize 0
+sync`). Four interleaved runs each way, `serialize` mode: without sync 2 wrong-frame messages in total
+(one run affected), with sync 8 (three runs affected), all +4. The sample is small, but the wrong pixels
+come from a later frame, not an unfinished write, and the sync happens between `allocate()` and the UID
+assignment, so it can only lengthen the window.
+
 The effect is intermittent: expect 0 to a few wrong-frame messages per run, always on the topic or
 topics that fall furthest behind. I did not see it at 15 Hz (12 topics) or 20 Hz (9 topics) in six
 runs with similar numbers of stale drops, so it may depend on the rate.
